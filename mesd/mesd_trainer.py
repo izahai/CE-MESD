@@ -17,7 +17,7 @@ from diffusers.pipelines.flux.pipeline_flux import calculate_shift, retrieve_tim
 from tqdm.auto import tqdm
 
 from utils.esd_checkpoint import save_esd_checkpoint
-from mend.sd_utils import esd_sd_call
+from mesd.sd_utils import esd_sd_call
 
 TARGET_MODULE_TYPES = {
     "Linear",
