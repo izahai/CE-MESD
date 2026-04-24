@@ -1,7 +1,7 @@
 import pytest
 import torch
 from diffusers import UNet2DConditionModel
-from mend.hook import parent_module
+from mesd.hook import parent_module
 
 @pytest.fixture(scope="module")
 def sd_unet():

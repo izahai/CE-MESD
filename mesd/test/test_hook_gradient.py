@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from diffusers import UNet2DConditionModel
 
-from mend.hook import parent_module, linear_backward_hook, linear_forward_hook
+from mesd.hook import parent_module, linear_backward_hook, linear_forward_hook
 
 def test_fake_gradient_hook():
     layer = nn.Linear(320, 1280).cuda()
