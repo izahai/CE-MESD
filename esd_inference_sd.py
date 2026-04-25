@@ -269,8 +269,7 @@ def main() -> None:
 
     dtype = torch.bfloat16 if args.device.startswith("cuda") and torch.cuda.is_available() else torch.float32
     
-    if args.watermark:
-        detector = NudeDetector()
+    detector = NudeDetector() if args.watermark else None
 
     pipe = StableDiffusionPipeline.from_pretrained(
         args.basemodel_id,
@@ -305,10 +304,11 @@ def main() -> None:
             pipe.unet.load_state_dict(original_weights, strict=False)
             orig = generate_one(pipe, seed=seed, **gen_kwargs)
             
-            # Detect NSFW
-            boxes = detect_nsfw_regions(detector ,orig)
-            if boxes:
-                orig = watermark_regions(orig, boxes)
+            if args.watermark and detector is not None:
+                # Detect and censor only when watermarking is enabled.
+                boxes = detect_nsfw_regions(detector, orig)
+                if boxes:
+                    orig = watermark_regions(orig, boxes)
 
             original_images.append(orig)
 
@@ -316,10 +316,11 @@ def main() -> None:
             pipe.unet.load_state_dict(esd_weights, strict=False)
             trained = generate_one(pipe, seed=seed, **gen_kwargs)
             
-            # Detect NSFW
-            boxes = detect_nsfw_regions(detector, trained)
-            if boxes:
-                trained = watermark_regions(trained, boxes)
+            if args.watermark and detector is not None:
+                # Detect and censor only when watermarking is enabled.
+                boxes = detect_nsfw_regions(detector, trained)
+                if boxes:
+                    trained = watermark_regions(trained, boxes)
 
             trained_images.append(trained)  
     
