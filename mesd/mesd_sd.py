@@ -24,9 +24,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--guidance_scale", help="guidance scale used to sample xt", type=float, default=3)
     parser.add_argument(
         "--train_method",
-        help="train method (esd-x, esd-u, esd-all, esd-x-strict, selfattn). Legacy aliases still work.",
+        help="train method (esd-x, esd-u, esd-all, esd-x-strict, selfattn, specific-layer). Legacy aliases still work.",
         type=str,
         required=True,
+    )
+    parser.add_argument(
+        "--target_layers",
+        help="module paths to train when --train_method specific-layer is used",
+        nargs="+",
+        default=None,
     )
     parser.add_argument("--iterations", help="number of optimization steps", type=int, default=200)
     parser.add_argument(
@@ -66,6 +72,7 @@ def main() -> None:
         save_path=args.save_path,
         device=args.device,
         torch_dtype=torch.bfloat16,
+        target_layers=args.target_layers,
     )
     checkpoint_path = run_esd_training(config)
     print(f"Saved checkpoint to {checkpoint_path}")

@@ -103,7 +103,7 @@ class MLP(nn.Module):
         if act == "relu":
             self.act = nn.ReLU()
         elif act == "learned":
-            self.act = ActMLP(10, 1)
+            self.act = ActMLP(10, 1) # Not implement yet
         else:
             raise ValueError(f"Unrecognized activation function '{act}'")
 
