@@ -6,8 +6,8 @@ import os
 os.makedirs("data", exist_ok=True)
 
 objects = [
-    "fork", "spoon", "bowl", "dining table", "apple", 
-    "bottle", "person", "car", "chair", "cell phone"
+    "fork", "spoon", "bowl", "dining table", "banana", 
+    "bottle", "dog", "car", "chair", "cell phone"
 ]
 artist = ""
 
