@@ -73,7 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="both",
         help="Inference mode: original | esd | both (default).",
     )
-    parser.add_argument("--watermark", type=bool, default=True)
+    parser.add_argument("--censor", action=argparse.BooleanOptionalAction, default=True)
     return parser
 
 
@@ -206,7 +206,7 @@ def detect_nsfw_regions(detector, image):
 
     return boxes
 
-def watermark_regions(
+def censor_regions(
     image: Image.Image,
     boxes,
 ):
@@ -269,7 +269,7 @@ def main() -> None:
 
     dtype = torch.bfloat16 if args.device.startswith("cuda") and torch.cuda.is_available() else torch.float32
     
-    detector = NudeDetector() if args.watermark else None
+    detector = NudeDetector() if args.censor else None
 
     pipe = StableDiffusionPipeline.from_pretrained(
         args.basemodel_id,
@@ -304,11 +304,11 @@ def main() -> None:
             pipe.unet.load_state_dict(original_weights, strict=False)
             orig = generate_one(pipe, seed=seed, **gen_kwargs)
             
-            if args.watermark and detector is not None:
-                # Detect and censor only when watermarking is enabled.
+            if args.censor and detector is not None:
+                # Detect and censor only when censoring is enabled.
                 boxes = detect_nsfw_regions(detector, orig)
                 if boxes:
-                    orig = watermark_regions(orig, boxes)
+                    orig = censor_regions(orig, boxes)
 
             original_images.append(orig)
 
@@ -316,11 +316,11 @@ def main() -> None:
             pipe.unet.load_state_dict(esd_weights, strict=False)
             trained = generate_one(pipe, seed=seed, **gen_kwargs)
             
-            if args.watermark and detector is not None:
-                # Detect and censor only when watermarking is enabled.
+            if args.censor and detector is not None:
+                # Detect and censor only when censoring is enabled.
                 boxes = detect_nsfw_regions(detector, trained)
                 if boxes:
-                    trained = watermark_regions(trained, boxes)
+                    trained = censor_regions(trained, boxes)
 
             trained_images.append(trained)  
     
