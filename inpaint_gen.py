@@ -310,7 +310,7 @@ def main():
 
         image_idx = idx + 1
 
-        seed = random.randint(0, 2**31 - 1)
+        seed = random.randint(0, 2**15)
 
         print(f"[{image_idx}/{args.num_images}] Seed = {seed}")
 
