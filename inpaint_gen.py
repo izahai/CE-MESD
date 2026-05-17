@@ -9,15 +9,15 @@ import numpy as np
 import torch
 from diffusers import (
     StableDiffusionPipeline,
-    StableDiffusionInpaintPipeline,
+    AutoPipelineForInpainting,
 )
 from PIL import Image, ImageDraw
 from nudenet import NudeDetector
 
 
-# ------------------------------------------------------------
+# ============================================================
 # NudeNet Detection Settings
-# ------------------------------------------------------------
+# ============================================================
 
 TARGET_LABELS = {
     "FEMALE_BREAST_EXPOSED",
@@ -27,19 +27,21 @@ TARGET_LABELS = {
     "ANUS_EXPOSED",
 }
 
-CONF_THRESHOLD = 0.2
+CONF_THRESHOLD = 0.1
 
 
-# ------------------------------------------------------------
+# ============================================================
 # CLI
-# ------------------------------------------------------------
+# ============================================================
 
 def build_parser():
+
     parser = argparse.ArgumentParser(
         description=(
             "Generate a dataset using Stable Diffusion v1.4, "
-            "automatically detect sensitive regions with NudeNet, "
-            "inpaint them, and save metadata."
+            "detect sensitive regions with NudeNet, "
+            "inpaint them using Kandinsky 2.2, "
+            "and save metadata."
         )
     )
 
@@ -47,7 +49,7 @@ def build_parser():
         "--output_dir",
         type=str,
         required=True,
-        help="Directory where images and metadata.json will be saved.",
+        help="Directory where images and metadata.json are saved.",
     )
 
     parser.add_argument(
@@ -61,7 +63,7 @@ def build_parser():
         "--inpaint_prompt",
         type=str,
         required=True,
-        help="Prompt used to inpaint sensitive regions.",
+        help="Prompt used for inpainting.",
     )
 
     parser.add_argument(
@@ -74,7 +76,7 @@ def build_parser():
     parser.add_argument(
         "--negative_prompt",
         type=str,
-        default="nsfw, nude, naked, exposed body parts, explicit content",
+        default="nsfw, nude, naked, exposed, bad anatomy",
     )
 
     parser.add_argument(
@@ -93,6 +95,7 @@ def build_parser():
         "--steps",
         type=int,
         default=30,
+        help="Generation inference steps.",
     )
 
     parser.add_argument(
@@ -104,19 +107,28 @@ def build_parser():
     parser.add_argument(
         "--inpaint_steps",
         type=int,
-        default=40,
+        default=50,
     )
 
     parser.add_argument(
         "--inpaint_guidance",
         type=float,
-        default=7.5,
+        default=4.0,
+        help="Kandinsky 2.2 works best around 4.0",
     )
 
     parser.add_argument(
-        "--mask_padding",
+        "--padding_x",
+        type=int,
+        default=40,
+        help="Horizontal mask expansion.",
+    )
+
+    parser.add_argument(
+        "--padding_y",
         type=int,
         default=16,
+        help="Vertical mask expansion.",
     )
 
     parser.add_argument(
@@ -128,86 +140,12 @@ def build_parser():
     return parser
 
 
-# ------------------------------------------------------------
-# NudeNet Detection
-# ------------------------------------------------------------
+# ============================================================
+# Random Seed Helper
+# ============================================================
 
-def detect_sensitive_regions(detector, image: Image.Image):
-    """
-    Detect sensitive exposed regions using NudeNet.
+def make_generator(seed: int, device: str):
 
-    Returns:
-        list[(x1, y1, x2, y2)]
-    """
-
-    image_np = np.array(image)
-    results = detector.detect(image_np)
-
-    boxes = []
-
-    for result in results:
-
-        label = result["class"]
-        score = result["score"]
-
-        if label not in TARGET_LABELS:
-            continue
-
-        if score < CONF_THRESHOLD:
-            continue
-
-        x, y, w, h = result["box"]
-
-        x1 = int(x)
-        y1 = int(y)
-        x2 = int(x + w)
-        y2 = int(y + h)
-
-        boxes.append((x1, y1, x2, y2))
-
-    return boxes
-
-
-# ------------------------------------------------------------
-# Mask Creation
-# ------------------------------------------------------------
-
-def create_mask(
-    image_size,
-    boxes,
-    padding=16,
-):
-    """
-    Create a binary mask:
-    - Black = keep
-    - White = regenerate
-    """
-
-    mask = Image.new("L", image_size, 0)
-    draw = ImageDraw.Draw(mask)
-
-    width, height = image_size
-
-    for (x1, y1, x2, y2) in boxes:
-
-        px1 = max(0, x1 - padding)
-        py1 = max(0, y1 - padding)
-        px2 = min(width, x2 + padding)
-        py2 = min(height, y2 + padding)
-
-        draw.rectangle(
-            [px1, py1, px2, py2],
-            fill=255,
-        )
-
-    return mask
-
-
-# ------------------------------------------------------------
-# Seed Helper
-# ------------------------------------------------------------
-
-def make_generator(seed, device):
     gen_device = (
         "cuda"
         if device.startswith("cuda") and torch.cuda.is_available()
@@ -217,16 +155,111 @@ def make_generator(seed, device):
     return torch.Generator(device=gen_device).manual_seed(seed)
 
 
-# ------------------------------------------------------------
+# ============================================================
+# NudeNet Detection
+# ============================================================
+
+def detect_nsfw_regions(
+    detector,
+    image: Image.Image,
+):
+    """
+    Detect NSFW regions.
+
+    Returns:
+        raw NudeNet results
+    """
+
+    image_np = np.array(image)
+
+    results = detector.detect(image_np)
+
+    filtered = []
+
+    for r in results:
+
+        label = r["class"]
+        score = r["score"]
+
+        if label not in TARGET_LABELS:
+            continue
+
+        if score < CONF_THRESHOLD:
+            continue
+
+        filtered.append(r)
+
+    return filtered
+
+
+# ============================================================
+# Dynamic Mask Creation
+# ============================================================
+
+def create_dynamic_mask(
+    image_size: tuple[int, int],
+    results: list[dict],
+    padding_x: int = 40,
+    padding_y: int = 16,
+):
+    """
+    Create a dynamic binary mask.
+
+    - Breasts get normal padding.
+    - Lower-body regions get wider horizontal padding.
+    """
+
+    mask = Image.new("L", image_size, 0)
+
+    draw = ImageDraw.Draw(mask)
+
+    width, height = image_size
+
+    for r in results:
+
+        label = r["class"]
+
+        x, y, w, h = r["box"]
+
+        x1 = int(x)
+        y1 = int(y)
+        x2 = int(x + w)
+        y2 = int(y + h)
+
+        # Wider masks for lower-body regions
+        if label == "FEMALE_BREAST_EXPOSED":
+            current_padding_x = padding_x
+        else:
+            current_padding_x = padding_x * 3
+
+        px1 = max(0, x1 - current_padding_x)
+        py1 = max(0, y1 - padding_y)
+
+        px2 = min(width, x2 + current_padding_x)
+        py2 = min(height, y2 + padding_y)
+
+        draw.rectangle(
+            [px1, py1, px2, py2],
+            fill=255,
+        )
+
+    return mask
+
+
+# ============================================================
 # Main
-# ------------------------------------------------------------
+# ============================================================
 
 def main():
 
     args = build_parser().parse_args()
 
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     metadata = []
 
@@ -236,7 +269,11 @@ def main():
         else torch.float32
     )
 
-    print("Loading Stable Diffusion v1.4 generation pipeline...")
+    # --------------------------------------------------------
+    # Load SD v1.4 Generation Pipeline
+    # --------------------------------------------------------
+
+    print("Loading Stable Diffusion v1.4...")
 
     gen_pipe = StableDiffusionPipeline.from_pretrained(
         "CompVis/stable-diffusion-v1-4",
@@ -244,32 +281,46 @@ def main():
         safety_checker=None,
     ).to(args.device)
 
-    print("Loading Stable Diffusion inpainting pipeline...")
+    # --------------------------------------------------------
+    # Load Kandinsky 2.2 Inpainting Pipeline
+    # --------------------------------------------------------
 
-    inpaint_pipe = StableDiffusionInpaintPipeline.from_pretrained(
-        "runwayml/stable-diffusion-inpainting",
+    print("Loading Kandinsky 2.2 inpainting pipeline...")
+
+    inpaint_pipe = AutoPipelineForInpainting.from_pretrained(
+        "kandinsky-community/kandinsky-2-2-decoder-inpaint",
         torch_dtype=dtype,
-        safety_checker=None,
     ).to(args.device)
+
+    # --------------------------------------------------------
+    # NudeNet
+    # --------------------------------------------------------
 
     print("Loading NudeNet detector...")
 
     detector = NudeDetector()
 
-    print(f"Generating {args.num_images} images...\n")
+    print(f"\nGenerating {args.num_images} images...\n")
+
+    # ========================================================
+    # Main Dataset Loop
+    # ========================================================
 
     for idx in range(args.num_images):
 
-        image_index = idx + 1
+        image_idx = idx + 1
 
         seed = random.randint(0, 2**31 - 1)
 
-        print(f"[{image_index}/{args.num_images}] Seed: {seed}")
+        print(f"[{image_idx}/{args.num_images}] Seed = {seed}")
 
-        generator = make_generator(seed, args.device)
+        generator = make_generator(
+            seed,
+            args.device,
+        )
 
         # ----------------------------------------------------
-        # 1. Generate Initial Image
+        # 1. Generate Image
         # ----------------------------------------------------
 
         generated_image = gen_pipe(
@@ -286,7 +337,7 @@ def main():
         # 2. Detect Sensitive Regions
         # ----------------------------------------------------
 
-        boxes = detect_sensitive_regions(
+        detections = detect_nsfw_regions(
             detector,
             generated_image,
         )
@@ -295,23 +346,27 @@ def main():
         # 3. Inpaint If Needed
         # ----------------------------------------------------
 
-        if boxes:
+        if detections:
 
-            print(f"    Detected {len(boxes)} sensitive region(s).")
+            print(f"    Detected {len(detections)} NSFW region(s).")
 
-            mask = create_mask(
+            mask_image = create_dynamic_mask(
                 generated_image.size,
-                boxes,
-                padding=args.mask_padding,
+                detections,
+                padding_x=args.padding_x,
+                padding_y=args.padding_y,
             )
 
-            inpaint_generator = make_generator(seed, args.device)
+            inpaint_generator = make_generator(
+                seed,
+                args.device,
+            )
 
             final_image = inpaint_pipe(
                 prompt=args.inpaint_prompt,
                 negative_prompt=args.negative_prompt,
                 image=generated_image,
-                mask_image=mask,
+                mask_image=mask_image,
                 num_inference_steps=args.inpaint_steps,
                 guidance_scale=args.inpaint_guidance,
                 generator=inpaint_generator,
@@ -319,7 +374,7 @@ def main():
 
         else:
 
-            print("    No sensitive regions detected.")
+            print("    No NSFW regions detected.")
 
             final_image = generated_image
 
@@ -327,7 +382,7 @@ def main():
         # 4. Save Final Image
         # ----------------------------------------------------
 
-        image_filename = f"image_{image_index:04d}.png"
+        image_filename = f"image_{image_idx:05d}.png"
 
         image_path = output_dir / image_filename
 
@@ -342,18 +397,20 @@ def main():
 
         print(f"    Saved -> {image_filename}")
 
-    # --------------------------------------------------------
-    # Save Metadata JSON
-    # --------------------------------------------------------
+    # ========================================================
+    # Save Metadata
+    # ========================================================
 
     metadata_path = output_dir / "metadata.json"
 
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    print("\nDone!")
-    print(f"Images saved to: {output_dir}")
-    print(f"Metadata saved to: {metadata_path}")
+    print("\n================================================")
+    print("Dataset generation complete.")
+    print(f"Images:   {output_dir}")
+    print(f"Metadata: {metadata_path}")
+    print("================================================")
 
 
 if __name__ == "__main__":
