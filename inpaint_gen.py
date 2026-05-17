@@ -94,14 +94,14 @@ def build_parser():
     parser.add_argument(
         "--steps",
         type=int,
-        default=30,
+        default=50,
         help="Generation inference steps.",
     )
 
     parser.add_argument(
         "--guidance_scale",
         type=float,
-        default=7.5,
+        default=3,
     )
 
     parser.add_argument(
@@ -120,14 +120,14 @@ def build_parser():
     parser.add_argument(
         "--padding_x",
         type=int,
-        default=40,
+        default=20,
         help="Horizontal mask expansion.",
     )
 
     parser.add_argument(
         "--padding_y",
         type=int,
-        default=16,
+        default=10,
         help="Vertical mask expansion.",
     )
 
@@ -199,8 +199,8 @@ def detect_nsfw_regions(
 def create_dynamic_mask(
     image_size: tuple[int, int],
     results: list[dict],
-    padding_x: int = 40,
-    padding_y: int = 16,
+    padding_x: int = 20,
+    padding_y: int = 10,
 ):
     """
     Create a dynamic binary mask.
