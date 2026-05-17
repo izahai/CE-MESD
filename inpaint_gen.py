@@ -27,7 +27,10 @@ TARGET_LABELS = {
     "ANUS_EXPOSED",
 }
 
+# The baseline threshold inside the detector function
 CONF_THRESHOLD = 0.1
+# The higher threshold required to accept the image for dataset inclusion
+QUALITY_CONF_THRESHOLD = 0.6
 
 
 # ============================================================
@@ -309,74 +312,78 @@ def main():
     for idx in range(args.num_images):
 
         image_idx = idx + 1
+        
+        # Inner loop to find a seed that meets the quality threshold
+        while True:
+            seed = random.randint(0, 2**15)
 
-        seed = random.randint(0, 2**15)
+            print(f"[{image_idx}/{args.num_images}] Trying Seed = {seed}...")
 
-        print(f"[{image_idx}/{args.num_images}] Seed = {seed}")
-
-        generator = make_generator(
-            seed,
-            args.device,
-        )
-
-        # ----------------------------------------------------
-        # 1. Generate Image
-        # ----------------------------------------------------
-
-        generated_image = gen_pipe(
-            prompt=args.prompt,
-            negative_prompt=args.negative_prompt,
-            height=args.height,
-            width=args.width,
-            num_inference_steps=args.steps,
-            guidance_scale=args.guidance_scale,
-            generator=generator,
-        ).images[0]
-
-        # ----------------------------------------------------
-        # 2. Detect Sensitive Regions
-        # ----------------------------------------------------
-
-        detections = detect_nsfw_regions(
-            detector,
-            generated_image,
-        )
-
-        # ----------------------------------------------------
-        # 3. Inpaint If Needed
-        # ----------------------------------------------------
-
-        if detections:
-
-            print(f"    Detected {len(detections)} NSFW region(s).")
-
-            mask_image = create_dynamic_mask(
-                generated_image.size,
-                detections,
-                padding_x=args.padding_x,
-                padding_y=args.padding_y,
-            )
-
-            inpaint_generator = make_generator(
+            generator = make_generator(
                 seed,
                 args.device,
             )
 
-            final_image = inpaint_pipe(
-                prompt=args.inpaint_prompt,
+            # ----------------------------------------------------
+            # 1. Generate Image
+            # ----------------------------------------------------
+
+            generated_image = gen_pipe(
+                prompt=args.prompt,
                 negative_prompt=args.negative_prompt,
-                image=generated_image,
-                mask_image=mask_image,
-                num_inference_steps=args.inpaint_steps,
-                guidance_scale=args.inpaint_guidance,
-                generator=inpaint_generator,
+                height=args.height,
+                width=args.width,
+                num_inference_steps=args.steps,
+                guidance_scale=args.guidance_scale,
+                generator=generator,
             ).images[0]
 
-        else:
+            # ----------------------------------------------------
+            # 2. Detect Sensitive Regions
+            # ----------------------------------------------------
 
-            print("    No NSFW regions detected.")
+            detections = detect_nsfw_regions(
+                detector,
+                generated_image,
+            )
 
-            final_image = generated_image
+            # Check if any detected region passes our strict quality threshold (0.6)
+            has_high_conf_detection = any(
+                det["score"] >= QUALITY_CONF_THRESHOLD for det in detections
+            )
+
+            if has_high_conf_detection:
+                break  # Seed accepted, exit the retry loop
+            else:
+                print(f"    -> Seed {seed} dropped. No target classes detected above confidence {QUALITY_CONF_THRESHOLD}.")
+
+        # ----------------------------------------------------
+        # 3. Inpaint (Since we broke out of the loop, detections exist)
+        # ----------------------------------------------------
+
+        print(f"    Accepted! Detected {len(detections)} NSFW region(s).")
+
+        mask_image = create_dynamic_mask(
+            generated_image.size,
+            detections,
+            padding_x=args.padding_x,
+            padding_y=args.padding_y,
+        )
+
+        inpaint_generator = make_generator(
+            seed,
+            args.device,
+        )
+
+        final_image = inpaint_pipe(
+            prompt=args.inpaint_prompt,
+            negative_prompt=args.negative_prompt,
+            image=generated_image,
+            mask_image=mask_image,
+            num_inference_steps=args.inpaint_steps,
+            guidance_scale=args.inpaint_guidance,
+            generator=inpaint_generator,
+        ).images[0]
 
         # ----------------------------------------------------
         # 4. Save Final Image
