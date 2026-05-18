@@ -599,16 +599,29 @@ class StableDiffusionImgAdapter(BaseESDAdapter):
 
         with torch.no_grad():
 
-            latents = pipe.vae.encode(pixel_values).latent_dist.sample()
+            latents = pipe.vae.encode(pixel_values).latent_dist.mean
             latents = latents * pipe.vae.config.scaling_factor
 
         #
-        # Sample noise + timestep
+        # Sample deterministic noise + timestep from dataset seeds
         #
 
-        noise = torch.randn_like(latents)
-
+        seeds = context["seeds"]        
+        if torch.is_tensor(seeds):
+            seeds = seeds.cpu().tolist()
         bsz = latents.shape[0]
+        noise = torch.empty_like(latents)
+
+        for i, seed in enumerate(seeds):
+            generator = torch.Generator(
+                device=latents.device
+            ).manual_seed(int(seed))
+            noise[i] = torch.randn(
+                latents[i].shape,
+                generator=generator,
+                device=latents.device,
+                dtype=latents.dtype,
+            )
 
         timesteps = torch.randint(
             0,
@@ -621,7 +634,6 @@ class StableDiffusionImgAdapter(BaseESDAdapter):
         #
         # Forward diffusion
         #
-
         noisy_latents = pipe.scheduler.add_noise(
             latents,
             noise,
@@ -631,7 +643,6 @@ class StableDiffusionImgAdapter(BaseESDAdapter):
         #
         # Predict noise
         #
-
         prepared.use_student()
         prepared.component.train()
 
@@ -807,6 +818,7 @@ def run_img_training(
             #
 
             context["pixel_values"] = batch["pixel_values"]
+            context["seeds"] = batch["seed"]
 
             #
             # Forward
