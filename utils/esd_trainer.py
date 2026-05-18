@@ -12,6 +12,7 @@ from typing import Any, Dict, Iterable, Iterator, Mapping, Optional
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 from diffusers import FluxPipeline, StableDiffusionPipeline, StableDiffusionXLPipeline
 from diffusers.pipelines.flux.pipeline_flux import calculate_shift, retrieve_timesteps as retrieve_flux_timesteps
 from tqdm.auto import tqdm
@@ -480,674 +481,182 @@ class StableDiffusionESDAdapter(BaseESDAdapter):
 
         target = noise_pred_erase_from - config.negative_guidance * (noise_pred_erase - noise_pred_null)
         return StepResult(model_pred=model_pred, target=target, timestep_index=run_till_timestep)
-
-
-class StableDiffusionXLESDAdapter(BaseESDAdapter):
-    family = "sdxl"
+    
+class StableDiffusionImgAdapter(BaseESDAdapter):
+    family = "sd_img"
     component_attr = "unet"
-    default_base_model_id = "stabilityai/stable-diffusion-xl-base-1.0"
-    default_save_path = "esd-models/sdxl/"
+    default_base_model_id = "CompVis/stable-diffusion-v1-4"
+    default_save_path = "trained-models/sd-img/"
 
     def normalize_train_method(self, train_method: str) -> str:
         aliases = {
             "xattn": "esd-x",
             "noxattn": "esd-u",
             "full": "esd-all",
-            "xattn-strict": "esd-x-strict",
+            "selfattn": "selfattn",
             "esd-x": "esd-x",
             "esd-u": "esd-u",
             "esd-all": "esd-all",
-            "esd-x-strict": "esd-x-strict",
         }
+
         normalized = aliases.get(train_method)
         if normalized is None:
-            raise ValueError(f"Unsupported SDXL train method: {train_method}")
-        if normalized in {"esd-u", "esd-all"}:
-            warnings.warn(
-                "SDXL `esd-u` and `esd-all` update a very large fraction of the UNet and can strongly degrade "
-                "overall model quality. Prefer `esd-x` or `esd-x-strict` unless you intentionally want global erasure.",
-                stacklevel=2,
-            )
+            raise ValueError(f"Unsupported train method: {train_method}")
+
         return normalized
 
     def default_lr_for_method(self, train_method: str) -> float:
-        if train_method.startswith("esd-x"):
-            return 2e-4
         return 1e-5
 
     def load_pipeline(self, config: ESDConfig):
-        pipe = StableDiffusionXLPipeline.from_pretrained(
+        pipe = StableDiffusionPipeline.from_pretrained(
             config.base_model_id,
             torch_dtype=config.torch_dtype,
             use_safetensors=True,
         ).to(config.device)
+
         pipe.vae.requires_grad_(False)
-        if pipe.text_encoder is not None:
-            pipe.text_encoder.requires_grad_(False)
-        if pipe.text_encoder_2 is not None:
-            pipe.text_encoder_2.requires_grad_(False)
+        pipe.text_encoder.requires_grad_(False)
+
+        if pipe.safety_checker is not None:
+            pipe.safety_checker.requires_grad_(False)
+
         return pipe
 
-    def select_parameter_names(self, component: torch.nn.Module, train_method: str) -> list[str]:
+    def select_parameter_names(
+        self,
+        component: torch.nn.Module,
+        train_method: str,
+    ) -> list[str]:
+
         def selector(module_name: str) -> bool:
             if train_method == "esd-x":
                 return "attn2" in module_name
+
             if train_method == "esd-u":
-                return "attn2" not in module_name and "emb" not in module_name and "block" in module_name
+                return "attn2" not in module_name
+
             if train_method == "esd-all":
-                return "emb" not in module_name and "block" in module_name
-            if train_method == "esd-x-strict":
-                return "attn2.to_k" in module_name or "attn2.to_v" in module_name
+                return True
+
+            if train_method == "selfattn":
+                return "attn1" in module_name
+
             return False
 
         return select_parameter_names(component, selector)
 
-    def prepare_context(self, pipe, config: ESDConfig) -> Dict[str, Any]:
+    def prepare_context(self, pipe, config: ESDConfig):
+
         resolution = self.resolve_resolution(pipe, config)
+
         with torch.no_grad():
-            erase_embeds, null_embeds, erase_pooled_embeds, null_pooled_embeds = pipe.encode_prompt(
+            prompt_embeds, _ = pipe.encode_prompt(
                 prompt=config.erase_concept,
                 device=config.device,
                 num_images_per_prompt=config.batch_size,
-                do_classifier_free_guidance=True,
-                negative_prompt="",
+                do_classifier_free_guidance=False,
             )
-            erase_embeds = erase_embeds.to(config.device)
-            null_embeds = null_embeds.to(config.device)
-            erase_pooled_embeds = erase_pooled_embeds.to(config.device)
-            null_pooled_embeds = null_pooled_embeds.to(config.device)
 
-            if pipe.text_encoder_2 is None:
-                text_encoder_projection_dim = int(erase_pooled_embeds.shape[-1])
-            else:
-                text_encoder_projection_dim = pipe.text_encoder_2.config.projection_dim
+            prompt_embeds = prompt_embeds.to(config.device)
 
-            add_time_ids = pipe._get_add_time_ids(
-                (resolution, resolution),
-                (0, 0),
-                (resolution, resolution),
-                dtype=erase_embeds.dtype,
-                text_encoder_projection_dim=text_encoder_projection_dim,
-            ).to(config.device)
-            add_time_ids = add_time_ids.repeat(config.batch_size, 1)
-
-            erase_from_embeds = None
-            erase_from_pooled_embeds = None
-            if config.erase_from is not None:
-                erase_from_embeds, _, erase_from_pooled_embeds, _ = pipe.encode_prompt(
-                    prompt=config.erase_from,
-                    device=config.device,
-                    num_images_per_prompt=config.batch_size,
-                    do_classifier_free_guidance=False,
-                    negative_prompt="",
-                )
-                erase_from_embeds = erase_from_embeds.to(config.device)
-                erase_from_pooled_embeds = erase_from_pooled_embeds.to(config.device)
-
-            timestep_cond = None
-            if pipe.unet.config.time_cond_proj_dim is not None:
-                guidance_scale_tensor = torch.tensor(config.guidance_scale - 1).repeat(config.batch_size)
-                timestep_cond = pipe.get_guidance_scale_embedding(
-                    guidance_scale_tensor,
-                    embedding_dim=pipe.unet.config.time_cond_proj_dim,
-                ).to(device=config.device, dtype=config.torch_dtype)
-
-        offload_modules_to_cpu(config.device, pipe.vae, pipe.text_encoder, pipe.text_encoder_2)
+        offload_modules_to_cpu(
+            config.device,
+            pipe.text_encoder,
+            pipe.safety_checker,
+        )
 
         return {
             "resolution": resolution,
-            "erase_embeds": erase_embeds,
-            "null_embeds": null_embeds,
-            "erase_pooled_embeds": erase_pooled_embeds,
-            "null_pooled_embeds": null_pooled_embeds,
-            "erase_from_embeds": erase_from_embeds,
-            "erase_from_pooled_embeds": erase_from_pooled_embeds,
-            "sample_prompt_embeds": erase_embeds if erase_from_embeds is None else erase_from_embeds,
-            "sample_negative_prompt_embeds": null_embeds,
-            "sample_pooled_prompt_embeds": erase_pooled_embeds if erase_from_pooled_embeds is None else erase_from_pooled_embeds,
-            "sample_negative_pooled_prompt_embeds": null_pooled_embeds,
-            "student_prompt_embeds": erase_embeds if erase_from_embeds is None else erase_from_embeds,
-            "student_pooled_prompt_embeds": erase_pooled_embeds if erase_from_pooled_embeds is None else erase_from_pooled_embeds,
-            "add_time_ids": add_time_ids,
-            "timestep_cond": timestep_cond,
+            "prompt_embeds": prompt_embeds,
         }
 
-    def training_step(self, pipe, prepared: PreparedComponent, context: Dict[str, Any], config: ESDConfig) -> StepResult:
-        run_till_timestep = random.randint(0, config.num_inference_steps - 1)
-        seed = random.randint(0, 2**15)
+    def training_step(
+        self,
+        pipe,
+        prepared: PreparedComponent,
+        context: Dict[str, Any],
+        config: ESDConfig,
+    ) -> StepResult:
 
-        prepared.use_base()
-        prepared.component.eval()
+        #
+        # EXPECTED EXTRA ITEMS IN CONTEXT:
+        #
+        # context["pixel_values"]
+        #
+        # shape:
+        # [B,3,H,W]
+        #
+
+        pixel_values = context["pixel_values"].to(
+            device=config.device,
+            dtype=pipe.vae.dtype,
+        )
+
+        #
+        # Encode image to latent
+        #
+
         with torch.no_grad():
-            xt = esd_sdxl_call(
-                pipe,
-                prompt_embeds=context["sample_prompt_embeds"],
-                negative_prompt_embeds=context["sample_negative_prompt_embeds"],
-                pooled_prompt_embeds=context["sample_pooled_prompt_embeds"],
-                negative_pooled_prompt_embeds=context["sample_negative_pooled_prompt_embeds"],
-                num_images_per_prompt=1,
-                num_inference_steps=config.num_inference_steps,
-                guidance_scale=config.guidance_scale,
-                run_till_timestep=run_till_timestep,
-                generator=make_sampling_generator(config.device, seed),
-                output_type="latent",
-                height=context["resolution"],
-                width=context["resolution"],
-            ).images
 
-            timestep = pipe.scheduler.timesteps[run_till_timestep]
-            erase_kwargs = {"text_embeds": context["erase_pooled_embeds"], "time_ids": context["add_time_ids"]}
-            noise_pred_erase = prepared.component(
-                xt,
-                timestep,
-                encoder_hidden_states=context["erase_embeds"],
-                timestep_cond=context["timestep_cond"],
-                cross_attention_kwargs=None,
-                added_cond_kwargs=erase_kwargs,
-                return_dict=False,
-            )[0]
+            latents = pipe.vae.encode(pixel_values).latent_dist.sample()
+            latents = latents * pipe.vae.config.scaling_factor
 
-            null_kwargs = {"text_embeds": context["null_pooled_embeds"], "time_ids": context["add_time_ids"]}
-            noise_pred_null = prepared.component(
-                xt,
-                timestep,
-                encoder_hidden_states=context["null_embeds"],
-                timestep_cond=context["timestep_cond"],
-                cross_attention_kwargs=None,
-                added_cond_kwargs=null_kwargs,
-                return_dict=False,
-            )[0]
+        #
+        # Sample noise + timestep
+        #
 
-            if context["erase_from_embeds"] is not None:
-                erase_from_kwargs = {
-                    "text_embeds": context["erase_from_pooled_embeds"],
-                    "time_ids": context["add_time_ids"],
-                }
-                noise_pred_erase_from = prepared.component(
-                    xt,
-                    timestep,
-                    encoder_hidden_states=context["erase_from_embeds"],
-                    timestep_cond=context["timestep_cond"],
-                    cross_attention_kwargs=None,
-                    added_cond_kwargs=erase_from_kwargs,
-                    return_dict=False,
-                )[0]
-            else:
-                noise_pred_erase_from = noise_pred_erase
+        noise = torch.randn_like(latents)
+
+        bsz = latents.shape[0]
+
+        timesteps = torch.randint(
+            0,
+            pipe.scheduler.config.num_train_timesteps,
+            (bsz,),
+            device=latents.device,
+            dtype=torch.long,
+        )
+
+        #
+        # Forward diffusion
+        #
+
+        noisy_latents = pipe.scheduler.add_noise(
+            latents,
+            noise,
+            timesteps,
+        )
+
+        #
+        # Predict noise
+        #
 
         prepared.use_student()
         prepared.component.train()
-        student_kwargs = {
-            "text_embeds": context["student_pooled_prompt_embeds"],
-            "time_ids": context["add_time_ids"],
-        }
+
         model_pred = prepared.component(
-            xt,
-            timestep,
-            encoder_hidden_states=context["student_prompt_embeds"],
-            timestep_cond=context["timestep_cond"],
-            cross_attention_kwargs=None,
-            added_cond_kwargs=student_kwargs,
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states=context["prompt_embeds"],
             return_dict=False,
         )[0]
 
-        target = noise_pred_erase_from - config.negative_guidance * (noise_pred_erase - noise_pred_null)
-        return StepResult(model_pred=model_pred, target=target, timestep_index=run_till_timestep)
+        #
+        # Standard diffusion MSE target
+        #
 
+        target = noise
 
-class FluxESDAdapter(BaseESDAdapter):
-    family = "flux"
-    component_attr = "transformer"
-    default_base_model_id = "black-forest-labs/FLUX.1-dev"
-    default_save_path = "esd-models/flux/"
-
-    def normalize_train_method(self, train_method: str) -> str:
-        aliases = {
-            "xattn": "esd-x",
-            "xattn-strict": "esd-x-strict",
-            "esd-x": "esd-x",
-            "esd-x-strict": "esd-x-strict",
-        }
-        normalized = aliases.get(train_method)
-        if normalized is None:
-            raise ValueError(f"Unsupported FLUX train method: {train_method}")
-        return normalized
-
-    def default_lr_for_method(self, train_method: str) -> float:
-        return 1e-4
-
-    def load_pipeline(self, config: ESDConfig):
-        # No VAE for ESD (unlike DreamBooth): training latents come only from the transformer
-        # sampling loop (`esd_flux_call` with `output_type="latent"`), never from pixel encode/decode.
-        # `vae=None` skips loading the VAE; `FluxPipeline` still sets `vae_scale_factor` (default 8) for geometry.
-        pipe = FluxPipeline.from_pretrained(
-            config.base_model_id,
-            vae=None,
-            torch_dtype=config.torch_dtype,
-            use_safetensors=True,
-        ).to(config.device)
-        if pipe.text_encoder is not None:
-            pipe.text_encoder.requires_grad_(False)
-        if getattr(pipe, "text_encoder_2", None) is not None:
-            pipe.text_encoder_2.requires_grad_(False)
-        return pipe
-
-    def build_metadata(self, config: ESDConfig) -> Dict[str, str]:
-        metadata = super().build_metadata(config)
-        metadata["max_sequence_length"] = str(config.max_sequence_length)
-        if config.inference_guidance_scale is not None:
-            metadata["inference_guidance_scale"] = str(config.inference_guidance_scale)
-        return metadata
-
-    def select_parameter_names(self, component: torch.nn.Module, train_method: str) -> list[str]:
-        def selector(module_name: str) -> bool:
-            if train_method == "esd-x":
-                return "attn" in module_name
-            if train_method == "esd-x-strict":
-                return "attn" in module_name and ("to_k" in module_name or "to_v" in module_name)
-            return False
-
-        return select_parameter_names(component, selector)
-
-    def prepare_context(self, pipe, config: ESDConfig) -> Dict[str, Any]:
-        resolution = self.resolve_resolution(pipe, config)
-        prompts = [config.erase_concept]
-        if config.erase_from is not None:
-            prompts.append(config.erase_from)
-        prompts.append("")
-        with torch.no_grad():
-            prompt_embeds_all, pooled_prompt_embeds_all, text_ids = pipe.encode_prompt(
-                prompts,
-                prompt_2=prompts,
-                num_images_per_prompt=config.batch_size,
-                max_sequence_length=config.max_sequence_length,
-            )
-
-            if config.erase_from is None:
-                erase_prompt_embeds, null_prompt_embeds = prompt_embeds_all.chunk(2)
-                erase_pooled_prompt_embeds, null_pooled_prompt_embeds = pooled_prompt_embeds_all.chunk(2)
-                erase_from_prompt_embeds = None
-                erase_from_pooled_prompt_embeds = None
-            else:
-                erase_prompt_embeds, erase_from_prompt_embeds, null_prompt_embeds = prompt_embeds_all.chunk(3)
-                erase_pooled_prompt_embeds, erase_from_pooled_prompt_embeds, null_pooled_prompt_embeds = (
-                    pooled_prompt_embeds_all.chunk(3)
-                )
-
-        # VAE is not loaded (`vae=None`); only move text encoders off the train device after caching embeds.
-        offload_modules_to_cpu(config.device, pipe.text_encoder, getattr(pipe, "text_encoder_2", None))
-
-        erase_prompt_embeds = erase_prompt_embeds.to(config.device)
-        null_prompt_embeds = null_prompt_embeds.to(config.device)
-        erase_pooled_prompt_embeds = erase_pooled_prompt_embeds.to(config.device)
-        null_pooled_prompt_embeds = null_pooled_prompt_embeds.to(config.device)
-        if erase_from_prompt_embeds is not None:
-            erase_from_prompt_embeds = erase_from_prompt_embeds.to(config.device)
-        if erase_from_pooled_prompt_embeds is not None:
-            erase_from_pooled_prompt_embeds = erase_from_pooled_prompt_embeds.to(config.device)
-
-        return {
-            "resolution": resolution,
-            "erase_prompt_embeds": erase_prompt_embeds,
-            "erase_from_prompt_embeds": erase_from_prompt_embeds,
-            "null_prompt_embeds": null_prompt_embeds,
-            "erase_pooled_prompt_embeds": erase_pooled_prompt_embeds,
-            "erase_from_pooled_prompt_embeds": erase_from_pooled_prompt_embeds,
-            "null_pooled_prompt_embeds": null_pooled_prompt_embeds,
-            # Flux `text_ids` is (seq_len, 3), same for all batch rows — do not slice dim 0 by batch_size.
-            "text_ids": text_ids.to(config.device),
-            "sample_prompt_embeds": erase_prompt_embeds if config.erase_from is None else erase_from_prompt_embeds,
-            "sample_pooled_prompt_embeds": erase_pooled_prompt_embeds if config.erase_from is None else erase_from_pooled_prompt_embeds,
-            "student_prompt_embeds": erase_prompt_embeds if config.erase_from is None else erase_from_prompt_embeds,
-            "student_pooled_prompt_embeds": erase_pooled_prompt_embeds if config.erase_from is None else erase_from_pooled_prompt_embeds,
-        }
-
-    def get_training_timesteps(self, pipe, num_inference_steps: int, image_seq_len: int, device: str):
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-        if getattr(pipe.scheduler.config, "use_flow_sigmas", False):
-            sigmas = None
-
-        mu = calculate_shift(
-            image_seq_len,
-            pipe.scheduler.config.get("base_image_seq_len", 256),
-            pipe.scheduler.config.get("max_image_seq_len", 4096),
-            pipe.scheduler.config.get("base_shift", 0.5),
-            pipe.scheduler.config.get("max_shift", 1.15),
+        return StepResult(
+            model_pred=model_pred,
+            target=target,
+            timestep_index=int(timesteps[0].item()),
         )
-        timesteps, _ = retrieve_flux_timesteps(
-            pipe.scheduler,
-            num_inference_steps,
-            device,
-            sigmas=sigmas,
-            mu=mu,
-        )
-        return timesteps
-
-    def training_step(self, pipe, prepared: PreparedComponent, context: Dict[str, Any], config: ESDConfig) -> StepResult:
-        run_till_timestep = random.randint(0, config.num_inference_steps - 1)
-        seed = random.randint(0, 2**15)
-
-        prepared.use_base()
-        prepared.component.eval()
-        with torch.no_grad():
-            xt = esd_flux_call(
-                pipe,
-                prompt_embeds=context["sample_prompt_embeds"],
-                pooled_prompt_embeds=context["sample_pooled_prompt_embeds"],
-                num_images_per_prompt=1,
-                num_inference_steps=config.num_inference_steps,
-                guidance_scale=config.inference_guidance_scale or config.guidance_scale,
-                max_sequence_length=config.max_sequence_length,
-                run_till_timestep=run_till_timestep,
-                generator=make_sampling_generator(config.device, seed),
-                output_type="latent",
-                height=context["resolution"],
-                width=context["resolution"],
-            ).images
-
-            timesteps = self.get_training_timesteps(
-                pipe,
-                num_inference_steps=config.num_inference_steps,
-                image_seq_len=xt.shape[1],
-                device=config.device,
-            )
-            timestep = timesteps[run_till_timestep].unsqueeze(0).to(config.device)
-            guidance = None
-            if pipe.transformer.config.guidance_embeds:
-                guidance = torch.full(
-                    [xt.shape[0]],
-                    config.guidance_scale,
-                    device=config.device,
-                    dtype=torch.float32,
-                )
-
-            # Patch grid must match packed latents from `prepare_latents` / DreamBooth-style training.
-            h_px = w_px = int(context["resolution"])
-            patch_h, patch_w = flux_latent_patch_grid_hw(h_px, w_px, pipe.vae_scale_factor)
-            expected_seq = patch_h * patch_w
-            if xt.shape[1] != expected_seq:
-                raise ValueError(
-                    f"FLUX packed latent length {xt.shape[1]} != patch grid {patch_h}×{patch_w}={expected_seq}. "
-                    "Sampling and transformer `img_ids` must use the same geometry as FluxPipeline.prepare_latents."
-                )
-            latent_image_ids = FluxPipeline._prepare_latent_image_ids(
-                xt.shape[0],
-                patch_h,
-                patch_w,
-                config.device,
-                config.torch_dtype,
-            )
-
-            noise_pred_null = prepared.component(
-                hidden_states=xt,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                pooled_projections=context["null_pooled_prompt_embeds"],
-                encoder_hidden_states=context["null_prompt_embeds"],
-                txt_ids=context["text_ids"],
-                img_ids=latent_image_ids,
-                return_dict=False,
-            )[0]
-            noise_pred_erase = prepared.component(
-                hidden_states=xt,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                pooled_projections=context["erase_pooled_prompt_embeds"],
-                encoder_hidden_states=context["erase_prompt_embeds"],
-                txt_ids=context["text_ids"],
-                img_ids=latent_image_ids,
-                return_dict=False,
-            )[0]
-            if context["erase_from_prompt_embeds"] is not None:
-                noise_pred_from = prepared.component(
-                    hidden_states=xt,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    pooled_projections=context["erase_from_pooled_prompt_embeds"],
-                    encoder_hidden_states=context["erase_from_prompt_embeds"],
-                    txt_ids=context["text_ids"],
-                    img_ids=latent_image_ids,
-                    return_dict=False,
-                )[0]
-            else:
-                noise_pred_from = noise_pred_erase
-
-        prepared.use_student()
-        prepared.component.train()
-        model_pred = prepared.component(
-            hidden_states=xt,
-            timestep=timestep / 1000,
-            guidance=guidance,
-            pooled_projections=context["student_pooled_prompt_embeds"],
-            encoder_hidden_states=context["student_prompt_embeds"],
-            txt_ids=context["text_ids"],
-            img_ids=latent_image_ids,
-            return_dict=False,
-        )[0]
-
-        target = noise_pred_from - config.negative_guidance * (noise_pred_erase - noise_pred_null)
-        return StepResult(model_pred=model_pred, target=target, timestep_index=run_till_timestep)
-
-
-class Flux2KleinESDAdapter(BaseESDAdapter):
-    family = "flux2_klein"
-    component_attr = "transformer"
-    default_base_model_id = "black-forest-labs/FLUX.2-klein-base-4B"
-    default_save_path = "esd-models/flux2-klein/"
-
-    def normalize_train_method(self, train_method: str) -> str:
-        aliases = {
-            "xattn": "esd-x",
-            "xattn-strict": "esd-x-strict",
-            "esd-x": "esd-x",
-            "esd-x-strict": "esd-x-strict",
-        }
-        normalized = aliases.get(train_method)
-        if normalized is None:
-            raise ValueError(f"Unsupported FLUX.2 Klein train method: {train_method}")
-        return normalized
-
-    def default_lr_for_method(self, train_method: str) -> float:
-        return 1e-4
-
-    def load_pipeline(self, config: ESDConfig):
-        try:
-            from diffusers import Flux2KleinPipeline
-        except ImportError as exc:
-            raise ImportError(
-                "FLUX.2 Klein support requires a newer diffusers/transformers install with `Flux2KleinPipeline`."
-            ) from exc
-
-        # Same as FLUX.1 ESD: no VAE — latents are produced in the Klein sampling path, not from pixels.
-        pipe = Flux2KleinPipeline.from_pretrained(
-            config.base_model_id,
-            vae=None,
-            torch_dtype=config.torch_dtype,
-            use_safetensors=True,
-        ).to(config.device)
-        pipe.text_encoder.requires_grad_(False)
-        return pipe
-
-    def build_metadata(self, config: ESDConfig) -> Dict[str, str]:
-        metadata = super().build_metadata(config)
-        metadata["max_sequence_length"] = str(config.max_sequence_length)
-        if config.inference_guidance_scale is not None:
-            metadata["inference_guidance_scale"] = str(config.inference_guidance_scale)
-        return metadata
-
-    def select_parameter_names(self, component: torch.nn.Module, train_method: str) -> list[str]:
-        attention_suffixes = (
-            "to_q",
-            "to_k",
-            "to_v",
-            "to_out.0",
-            "add_q_proj",
-            "add_k_proj",
-            "add_v_proj",
-            "to_add_out",
-        )
-        strict_suffixes = ("to_k", "to_v", "add_k_proj", "add_v_proj")
-
-        def selector(module_name: str) -> bool:
-            if train_method == "esd-x":
-                return module_name.endswith(attention_suffixes)
-            if train_method == "esd-x-strict":
-                return module_name.endswith(strict_suffixes)
-            return False
-
-        return select_parameter_names(component, selector)
-
-    def prepare_context(self, pipe, config: ESDConfig) -> Dict[str, Any]:
-        resolution = self.resolve_resolution(pipe, config)
-        with torch.no_grad():
-            erase_prompt_embeds, erase_text_ids = pipe.encode_prompt(
-                prompt=config.erase_concept,
-                device=config.device,
-                num_images_per_prompt=config.batch_size,
-                max_sequence_length=config.max_sequence_length,
-            )
-            erase_prompt_embeds = erase_prompt_embeds.to(config.device)
-            erase_text_ids = erase_text_ids.to(config.device)
-
-            null_prompt_embeds, null_text_ids = pipe.encode_prompt(
-                prompt="",
-                device=config.device,
-                num_images_per_prompt=config.batch_size,
-                max_sequence_length=config.max_sequence_length,
-            )
-            null_prompt_embeds = null_prompt_embeds.to(config.device)
-            null_text_ids = null_text_ids.to(config.device)
-
-            erase_from_prompt_embeds = None
-            erase_from_text_ids = None
-            if config.erase_from is not None:
-                erase_from_prompt_embeds, erase_from_text_ids = pipe.encode_prompt(
-                    prompt=config.erase_from,
-                    device=config.device,
-                    num_images_per_prompt=config.batch_size,
-                    max_sequence_length=config.max_sequence_length,
-                )
-                erase_from_prompt_embeds = erase_from_prompt_embeds.to(config.device)
-                erase_from_text_ids = erase_from_text_ids.to(config.device)
-
-        offload_modules_to_cpu(config.device, pipe.text_encoder)
-
-        return {
-            "resolution": resolution,
-            "erase_prompt_embeds": erase_prompt_embeds,
-            "erase_from_prompt_embeds": erase_from_prompt_embeds,
-            "null_prompt_embeds": null_prompt_embeds,
-            "erase_text_ids": erase_text_ids,
-            "erase_from_text_ids": erase_from_text_ids,
-            "null_text_ids": null_text_ids,
-            "sample_prompt_embeds": erase_prompt_embeds if erase_from_prompt_embeds is None else erase_from_prompt_embeds,
-            "sample_text_ids": erase_text_ids if erase_from_text_ids is None else erase_from_text_ids,
-            "student_prompt_embeds": erase_prompt_embeds if erase_from_prompt_embeds is None else erase_from_prompt_embeds,
-            "student_text_ids": erase_text_ids if erase_from_text_ids is None else erase_from_text_ids,
-        }
-
-    def get_training_timesteps(self, pipe, num_inference_steps: int, image_seq_len: int, device: str):
-        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
-        if getattr(pipe.scheduler.config, "use_flow_sigmas", False):
-            sigmas = None
-
-        mu = compute_empirical_mu(image_seq_len=image_seq_len, num_steps=num_inference_steps)
-        timesteps, _ = retrieve_flux2_klein_timesteps(
-            pipe.scheduler,
-            num_inference_steps,
-            device,
-            sigmas=sigmas,
-            mu=mu,
-        )
-        return timesteps
-
-    def training_step(self, pipe, prepared: PreparedComponent, context: Dict[str, Any], config: ESDConfig) -> StepResult:
-        run_till_timestep = random.randint(0, config.num_inference_steps - 1)
-        seed = random.randint(0, 2**15)
-
-        prepared.use_base()
-        prepared.component.eval()
-        with torch.no_grad():
-            sample_result = esd_flux2_klein_call(
-                pipe,
-                prompt_embeds=context["sample_prompt_embeds"],
-                negative_prompt_embeds=context["null_prompt_embeds"],
-                text_ids=context["sample_text_ids"],
-                negative_text_ids=context["null_text_ids"],
-                num_images_per_prompt=1,
-                num_inference_steps=config.num_inference_steps,
-                guidance_scale=config.inference_guidance_scale or config.guidance_scale,
-                max_sequence_length=config.max_sequence_length,
-                run_till_timestep=run_till_timestep,
-                generator=make_sampling_generator(config.device, seed),
-                output_type="latent",
-                height=context["resolution"],
-                width=context["resolution"],
-            )
-            xt = sample_result.images
-            latent_ids = sample_result.latent_ids
-
-            timesteps = self.get_training_timesteps(
-                pipe,
-                num_inference_steps=config.num_inference_steps,
-                image_seq_len=xt.shape[1],
-                device=config.device,
-            )
-            timestep = timesteps[run_till_timestep].unsqueeze(0).to(config.device)
-            guidance = None
-
-            noise_pred_null = prepared.component(
-                hidden_states=xt,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                encoder_hidden_states=context["null_prompt_embeds"],
-                txt_ids=context["null_text_ids"],
-                img_ids=latent_ids,
-                return_dict=False,
-            )[0]
-            noise_pred_erase = prepared.component(
-                hidden_states=xt,
-                timestep=timestep / 1000,
-                guidance=guidance,
-                encoder_hidden_states=context["erase_prompt_embeds"],
-                txt_ids=context["erase_text_ids"],
-                img_ids=latent_ids,
-                return_dict=False,
-            )[0]
-            if context["erase_from_prompt_embeds"] is not None:
-                noise_pred_from = prepared.component(
-                    hidden_states=xt,
-                    timestep=timestep / 1000,
-                    guidance=guidance,
-                    encoder_hidden_states=context["erase_from_prompt_embeds"],
-                    txt_ids=context["erase_from_text_ids"],
-                    img_ids=latent_ids,
-                    return_dict=False,
-                )[0]
-            else:
-                noise_pred_from = noise_pred_erase
-
-        prepared.use_student()
-        prepared.component.train()
-        model_pred = prepared.component(
-            hidden_states=xt,
-            timestep=timestep / 1000,
-            guidance=guidance,
-            encoder_hidden_states=context["student_prompt_embeds"],
-            txt_ids=context["student_text_ids"],
-            img_ids=latent_ids,
-            return_dict=False,
-        )[0]
-
-        target = noise_pred_from - config.negative_guidance * (noise_pred_erase - noise_pred_null)
-        return StepResult(model_pred=model_pred, target=target, timestep_index=run_till_timestep)
-
 
 ADAPTERS = {
     "sd": StableDiffusionESDAdapter(),
-    "sdxl": StableDiffusionXLESDAdapter(),
-    "flux": FluxESDAdapter(),
-    "flux2_klein": Flux2KleinESDAdapter(),
+    "sd_img": StableDiffusionImgAdapter(),
 }
 
 
@@ -1192,4 +701,175 @@ def run_esd_training(config: ESDConfig) -> str:
     prepared.use_student()
     checkpoint_path = adapter.build_checkpoint_path(config)
     save_esd_checkpoint(prepared.state_dict(), checkpoint_path, metadata=adapter.build_metadata(config))
+    return checkpoint_path
+
+def run_img_training(
+    config: ESDConfig,
+    dataset,
+) -> str:
+
+    adapter = get_adapter(config.family)
+
+    config.train_method = adapter.normalize_train_method(
+        config.train_method
+    )
+
+    #
+    # TF32
+    #
+
+    if config.allow_tf32 and torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+
+    #
+    # Load pipeline
+    #
+
+    with _suppress_transformers_pipeline_load_noise():
+        pipe = adapter.load_pipeline(config)
+
+    pipe.set_progress_bar_config(disable=True)
+
+    component = getattr(pipe, adapter.component_attr)
+
+    #
+    # Gradient checkpointing
+    #
+
+    if (
+        config.gradient_checkpointing
+        and hasattr(component, "enable_gradient_checkpointing")
+    ):
+        component.enable_gradient_checkpointing()
+
+    #
+    # Prepare trainable params
+    #
+
+    prepared = adapter.create_prepared_component(
+        pipe,
+        config.train_method,
+        config,
+    )
+
+    prepared.use_student()
+
+    #
+    # Optimizer
+    #
+
+    learning_rate = adapter.resolve_learning_rate(config)
+
+    optimizer = torch.optim.Adam(
+        prepared.parameters(),
+        lr=learning_rate,
+    )
+
+    #
+    # Prompt embeddings
+    #
+
+    context = adapter.prepare_context(pipe, config)
+
+    #
+    # Dataloader
+    #
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=config.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    #
+    # Training
+    #
+
+    global_step = 0
+
+    pbar = tqdm(
+        total=config.iterations,
+        desc=f"Training IMG ({adapter.family})",
+    )
+
+    while global_step < config.iterations:
+
+        for batch in dataloader:
+
+            if global_step >= config.iterations:
+                break
+
+            #
+            # Add images to context
+            #
+
+            context["pixel_values"] = batch["pixel_values"]
+
+            #
+            # Forward
+            #
+
+            optimizer.zero_grad(set_to_none=True)
+
+            step_result = adapter.training_step(
+                pipe,
+                prepared,
+                context,
+                config,
+            )
+
+            #
+            # MSE diffusion loss
+            #
+
+            loss = F.mse_loss(
+                step_result.model_pred.float(),
+                step_result.target.float(),
+            )
+
+            #
+            # Backward
+            #
+
+            loss.backward()
+
+            optimizer.step()
+
+            #
+            # Logging
+            #
+
+            postfix = {
+                "loss": f"{loss.item():.4f}",
+                "timestep": step_result.timestep_index,
+            }
+
+            postfix.update({
+                key: str(value)
+                for key, value in step_result.metrics.items()
+            })
+
+            pbar.set_postfix(postfix)
+
+            pbar.update(1)
+
+            global_step += 1
+
+    #
+    # Save checkpoint
+    #
+
+    prepared.use_student()
+
+    checkpoint_path = adapter.build_checkpoint_path(config)
+
+    save_esd_checkpoint(
+        prepared.state_dict(),
+        checkpoint_path,
+        metadata=adapter.build_metadata(config),
+    )
+
     return checkpoint_path
