@@ -4,6 +4,7 @@ import argparse
 import json
 import random
 from pathlib import Path
+from tqdm import tqdm
 
 import numpy as np
 import torch
@@ -73,7 +74,14 @@ def build_parser():
         "--num_images",
         type=int,
         required=True,
-        help="Number of images to generate.",
+        help="The total target size of the dataset (e.g., 200).",
+    )
+
+    parser.add_argument(
+        "--start_idx",
+        type=int,
+        default=1,
+        help="The index to start generating from (e.g., if set to 50, generates from 50 to num_images).",
     )
 
     parser.add_argument(
@@ -264,7 +272,17 @@ def main():
         exist_ok=True,
     )
 
-    metadata = []
+    # Try to load existing metadata if appending to a dataset
+    metadata_path = output_dir / "metadata.json"
+    if metadata_path.exists():
+        try:
+            with open(metadata_path, "r") as f:
+                metadata = json.load(f)
+            print(f"Loaded existing metadata with {len(metadata)} entries.")
+        except Exception:
+            metadata = []
+    else:
+        metadata = []
 
     dtype = (
         torch.float16
@@ -303,19 +321,33 @@ def main():
 
     detector = NudeDetector()
 
-    print(f"\nGenerating {args.num_images} images...\n")
+    # Calculate total images to generate in this run
+    total_to_generate = args.num_images - args.start_idx + 1
+    
+    if total_to_generate <= 0:
+        print(f"\nError: --start_idx ({args.start_idx}) cannot be greater than --num_images ({args.num_images})")
+        return
+
+    print(f"\nResuming/Starting execution from index {args.start_idx} to {args.num_images}.")
+    print(f"Generating {total_to_generate} images in this run...\n")
 
     # ========================================================
     # Main Dataset Loop
     # ========================================================
+    progress_bar = tqdm(
+        range(args.start_idx, args.num_images + 1),
+        desc="Generating Dataset",
+        unit="img"
+    )
 
-    for idx in range(args.num_images):
-
-        image_idx = idx + 1
+    # Loop goes from start_idx up to and including num_images
+    for image_idx in progress_bar:
         
         # Inner loop to find a seed that meets the quality threshold
         while True:
             seed = random.randint(0, 2**15)
+            
+            progress_bar.set_postfix_str(f"Trying Seed={seed}")
 
             print(f"[{image_idx}/{args.num_images}] Trying Seed = {seed}...")
 
@@ -395,6 +427,9 @@ def main():
 
         final_image.save(image_path)
 
+        # Remove previous entry for this index if appending/overwriting to avoid duplicates
+        metadata = [item for item in metadata if item["image"] != image_filename]
+
         metadata.append(
             {
                 "image": image_filename,
@@ -408,7 +443,8 @@ def main():
     # Save Metadata
     # ========================================================
 
-    metadata_path = output_dir / "metadata.json"
+    # Sort metadata by image name so it stays ordered
+    metadata.sort(key=lambda x: x["image"])
 
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
