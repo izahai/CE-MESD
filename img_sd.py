@@ -5,7 +5,7 @@ import torch
 
 sys.path.append(".")
 
-from utils.dataset import ImageDataset
+from utils.img_dataloader import ImageDataset
 from utils.esd_trainer import (
     ESDConfig,
     run_img_training,
